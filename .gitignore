@@ -1,0 +1,55 @@
+# Ignore Python virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+pytest_cache/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Streamlit specific
+.streamlit/secrets.toml
+
+# Python packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+.MANIFEST
+*.manifest
+
+# Local settings / logs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE settings
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Backup files
+*~
