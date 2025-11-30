@@ -3,7 +3,7 @@ from io import BytesIO
 import PyPDF2
 from typing import List, Dict
 
-# Import RAGEngine from your Streamlit app file
+#  RAGEngine from your Streamlit app file
 from streamlit_first_aid_rag_app import RAGEngine
 
 def download_pdf(url: str) -> bytes:
