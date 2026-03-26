@@ -24,7 +24,12 @@ from io import BytesIO
 import numpy as np
 import PyPDF2
 
+<<<<<<< HEAD
 from sentence_transformers import SentenceTransformer
+=======
+#  RAGEngine from your Streamlit app file
+from streamlit_first_aid_rag_app import RAGEngine
+>>>>>>> e4f94a24f423c2fd8417cd0ae19dc75de53a5d3e
 
 # Try FAISS
 try:
