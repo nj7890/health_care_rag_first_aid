@@ -1,308 +1,267 @@
-# streamlit_first_aid_rag_app.py
-# Minimal Streamlit RAG-style first-aid education app using open-source components.
-# Features:
-# - Upload authoritative documents (PDF / plain text / HTML) or paste text
-# - Chunking + embeddings (sentence-transformers)
-# - In-memory vector search (FAISS if available, fallback to sklearn)
-# - Deterministic answer assembly: returns short summary + numbered steps using retrieved excerpts
-# - Emergency detection (keywords) and clear "Call emergency services" banner
-# - Shows sources and exact excerpts used (traceability)
-
 import streamlit as st
-from io import BytesIO
-import tempfile
-import os
 import re
-from typing import List, Dict, Any, Tuple
+import requests
+from io import BytesIO
+import numpy as np
+from typing import List, Dict, Any
 
-# Text extraction
-try:
-    import PyPDF2
-except Exception:
-    PyPDF2 = None
+# PDF support
+import PyPDF2
 
 # Embeddings
 from sentence_transformers import SentenceTransformer
 
-# Vector search
+# Vector Search
 try:
     import faiss
-    _HAS_FAISS = True
-except Exception:
-    _HAS_FAISS = False
+    USE_FAISS = True
+except:
     from sklearn.neighbors import NearestNeighbors
-
-import numpy as np
-
-# ---------------------- Utility functions ----------------------
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    if PyPDF2 is None:
-        raise RuntimeError("PyPDF2 not installed. Please install PyPDF2 to support PDF uploads.")
-    reader = PyPDF2.PdfReader(BytesIO(file_bytes))
-    texts = []
-    for p in reader.pages:
-        try:
-            texts.append(p.extract_text() or "")
-        except Exception:
-            texts.append("")
-    return "\n\n".join(texts)
+    USE_FAISS = False
 
 
-def clean_text(t: str) -> str:
-    # basic cleaning
-    t = t.replace('\r', '\n')
-    t = re.sub('\n{3,}', '\n\n', t)
-    return t.strip()
+# ---------------- TEXT PROCESSING ----------------
+def clean_text(text: str) -> str:
+    text = text.replace('\r', '\n')
+    text = re.sub('\n{3,}', '\n\n', text)
+    return text.strip()
 
 
-def chunk_text(text: str, chunk_size: int = 400, stride: int = 50) -> List[str]:
+def chunk_text(text: str, chunk_size=400, stride=50):
     words = text.split()
     chunks = []
     i = 0
     while i < len(words):
-        chunk = words[i:i+chunk_size]
-        chunks.append(' '.join(chunk))
+        chunks.append(" ".join(words[i:i+chunk_size]))
         i += chunk_size - stride
     return chunks
 
 
-def emergency_check(query: str, chunks_texts: List[str]) -> Tuple[bool, List[str]]:
-    # Keywords that indicate life-threatening situations
-    keywords = [
-        'not breathing', 'no pulse', 'unconscious', 'severe bleeding', 'heavy bleeding',
-        'choking', 'cardiac arrest', 'no breathing', 'unresponsive', 'loss of consciousness'
+def extract_pdf(pdf_bytes: bytes) -> str:
+    reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+    pages = []
+    for p in reader.pages:
+        try:
+            pages.append(p.extract_text() or "")
+        except:
+            pages.append("")
+    return "\n".join(pages)
+
+
+# ---------------- EMERGENCY DETECTION ----------------
+def emergency_check(query: str, retrieved_chunks: List[str]) -> Dict[str, Any]:
+    patterns = [
+        r'not breathing|no breathing',
+        r'no pulse|cardiac arrest',
+        r'unconscious|unresponsive',
+        r'severe bleeding|heavy bleeding',
+        r'choking',
+        r'seizure',
+        r'collapse'
     ]
-    found = []
-    qlow = query.lower()
-    for k in keywords:
-        if k in qlow:
-            found.append(k)
-    # Also check retrieved chunks for presence of keywords
-    for t in chunks_texts:
-        tl = t.lower()
-        for k in keywords:
-            if k in tl and k not in found:
-                found.append(k)
-    return (len(found) > 0, found)
+
+    score = 0
+    triggers = []
+
+    combined = query.lower() + " " + " ".join(retrieved_chunks).lower()
+
+    for p in patterns:
+        if re.search(p, combined):
+            score += 1
+            triggers.append(p)
+
+    severity = "HIGH" if score >= 2 else "MEDIUM" if score == 1 else "LOW"
+
+    return {
+        "is_emergency": score > 0,
+        "severity": severity,
+        "triggers": triggers
+    }
 
 
-# ---------------------- RAG Engine ----------------------
+# ---------------- RAG ENGINE ----------------
 class RAGEngine:
-    def __init__(self, embed_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'):
-        self.embedder = SentenceTransformer(embed_model_name)
-        self.metadata: List[Dict[str, Any]] = []
-        self.text_chunks: List[str] = []
+    def __init__(self):
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.text_chunks = []
+        self.metadata = []
         self.embeddings = None
         self.index = None
-        self._use_faiss = _HAS_FAISS
 
-    def add_source(self, text: str, source_id: str, section: str = ''):
+    def add_source(self, text: str, source_id: str):
         text = clean_text(text)
         chunks = chunk_text(text)
+
         for i, c in enumerate(chunks):
-            meta = {'source_id': source_id, 'section': section, 'chunk_id': f"{source_id}__{i}"}
-            self.metadata.append(meta)
             self.text_chunks.append(c)
-        # rebuild embeddings lazily
-        self._rebuild_index()
+            self.metadata.append({
+                "source": source_id,
+                "chunk_id": f"{source_id}_{i}"
+            })
 
-    def _rebuild_index(self):
-        if len(self.text_chunks) == 0:
-            self.embeddings = None
-            self.index = None
+        self._build_index()
+
+    def _build_index(self):
+        if not self.text_chunks:
             return
-        self.embeddings = self.embedder.encode(self.text_chunks, convert_to_numpy=True, show_progress_bar=False)
-        if self._use_faiss:
-            d = self.embeddings.shape[1]
-            idx = faiss.IndexFlatL2(d)
-            idx.add(self.embeddings)
-            self.index = idx
-        else:
-            # sklearn NearestNeighbors
-            self.index = NearestNeighbors(n_neighbors=min(10, len(self.embeddings)), algorithm='auto').fit(self.embeddings)
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[Tuple[float, str, Dict[str, Any]]]:
-        if self.index is None:
-            return []
-        q_emb = self.embedder.encode([query], convert_to_numpy=True)[0]
-        if self._use_faiss:
-            D, I = self.index.search(np.expand_dims(q_emb, axis=0), top_k)
-            results = []
-            for dist, idx in zip(D[0], I[0]):
-                results.append((float(dist), self.text_chunks[int(idx)], self.metadata[int(idx)]))
-            return results
-        else:
-            dists, idxs = self.index.kneighbors([q_emb], n_neighbors=min(top_k, len(self.text_chunks)))
-            results = []
-            for dist, idx in zip(dists[0], idxs[0]):
-                results.append((float(dist), self.text_chunks[int(idx)], self.metadata[int(idx)]))
-            return results
+        self.embeddings = self.embedder.encode(self.text_chunks)
 
-    def assemble_answer(self, query: str, top_k: int = 5) -> Dict[str, Any]:
-        retrieved = self.retrieve(query, top_k=top_k)
+        if USE_FAISS:
+            dim = self.embeddings.shape[1]
+            self.index = faiss.IndexFlatL2(dim)
+            self.index.add(np.array(self.embeddings))
+        else:
+            self.index = NearestNeighbors().fit(self.embeddings)
+
+    def retrieve(self, query: str, top_k=5):
+        q_emb = self.embedder.encode([query])[0]
+
+        if USE_FAISS:
+            D, I = self.index.search(np.array([q_emb]), top_k)
+        else:
+            D, I = self.index.kneighbors([q_emb], n_neighbors=top_k)
+
+        results = []
+        query_terms = set(query.lower().split())
+
+        for dist, idx in zip(D[0], I[0]):
+            text = self.text_chunks[idx]
+            meta = self.metadata[idx]
+
+            overlap = len(query_terms.intersection(set(text.lower().split())))
+            score = float(dist) - 0.05 * overlap
+
+            results.append((score, text, meta))
+
+        results.sort(key=lambda x: x[0])
+        return results
+
+    def assemble_answer(self, query: str, top_k=5):
+        retrieved = self.retrieve(query, top_k)
+
         snippets = [r[1] for r in retrieved]
-        metas = [r[2] for r in retrieved]
+        emergency = emergency_check(query, snippets)
 
-        is_emergency, found_k = emergency_check(query, snippets)
+        steps, warnings, explain = [], [], []
 
-        # Deterministic assembly: create short summary + numbered steps by extracting imperative sentences
-        summary = 'Based on authoritative sources, here are the main recommended steps.'
+        for score, text, meta in retrieved:
+            sentences = re.split(r'(?<=[.!?])\s+', text)
 
-        # Extract candidate sentences that look like steps (start with verbs or contain 'call', 'apply', etc.)
-        candidate_sentences = []
-        for s, m in zip(snippets, metas):
-            sentences = re.split(r'(?<=[.!?])\s+', s)
             for sent in sentences:
                 sent = sent.strip()
-                if len(sent) < 10: continue
-                # naive heuristic: imperative sentences often start with a verb or 'call'
-                if re.match(r'^(Call|Apply|Stop|Place|Hold|Lay|Perform|Check|Ensure|Give|Tilt|Compress)\b', sent, flags=re.I) or 'call' in sent.lower() or 'apply' in sent.lower() or 'compress' in sent.lower():
-                    candidate_sentences.append({'text': sent, 'meta': m})
-        # If not many candidates, fall back to top sentences from snippets
-        if len(candidate_sentences) < 3:
-            for s, m in zip(snippets, metas):
-                sentences = re.split(r'(?<=[.!?])\s+', s)
-                for sent in sentences[:3]:
-                    sent = sent.strip()
-                    if len(sent) >= 10:
-                        candidate_sentences.append({'text': sent, 'meta': m})
-        # Deduplicate while preserving order
-        seen = set()
-        ordered = []
-        for c in candidate_sentences:
-            key = c['text'][:120]
-            if key in seen: continue
-            seen.add(key)
-            ordered.append(c)
-            if len(ordered) >= 6:
+
+                if len(sent) < 15:
+                    continue
+
+                if re.match(r'^(Call|Apply|Check|Place|Keep|Stop|Perform|Ensure)', sent, re.I):
+                    steps.append(sent)
+                    explain.append({
+                        "step": sent,
+                        "source": meta["source"],
+                        "confidence": round(1 / (1 + score), 3)
+                    })
+
+                if "do not" in sent.lower() or "avoid" in sent.lower():
+                    warnings.append(sent)
+
+            if len(steps) >= 6:
                 break
 
-        steps = [c['text'] for c in ordered]
-
-        sources = []
-        for r in retrieved:
-            _, text, meta = r
-            sources.append({'source_id': meta.get('source_id', ''), 'excerpt': text[:500]})
-
         return {
-            'summary': summary,
-            'steps': steps,
-            'sources': sources,
-            'is_emergency': is_emergency,
-            'emergency_keys': found_k
+            "steps": steps[:6],
+            "warnings": warnings[:3],
+            "explain": explain,
+            "sources": retrieved,
+            "emergency": emergency
         }
 
 
-# ---------------------- Streamlit UI ----------------------
+# ---------------- STREAMLIT UI ----------------
+st.set_page_config(page_title="First-Aid RAG", layout="wide")
+st.title("🚑 First-Aid RAG Assistant (Explainable & Safe)")
 
-st.set_page_config(page_title='First-Aid RAG (Open Source) — Streamlit', layout='wide')
-st.title('First-Aid Education — RAG (open-source)')
-st.markdown(
-    """
-    This is a minimal Retrieval-Augmented-Generation (RAG) style Streamlit app that **assembles first-aid guidance** from uploaded authoritative documents.
+# Initialize session
+if "rag" not in st.session_state:
+    st.session_state.rag = RAGEngine()
 
-    **Design choices:**
-    - Uses sentence-transformers embeddings + in-memory vector search.
-    - Answers are constructed from retrieved authoritative excerpts (no external LLM required).
-    - Emergency detection flags life-threatening queries and shows a prominent "Call emergency services" banner.
+rag = st.session_state.rag
 
-    Upload PDFs or paste text to build the knowledge base, then ask first-aid questions.
-    """
-)
 
-# Sidebar: model info and ingestion
-with st.sidebar:
-    st.header('Knowledge Base')
-    st.info('Upload authoritative documents (PDF / plain text) or paste text. Each upload becomes a source.')
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("Knowledge Base")
 
-    uploaded_file = st.file_uploader('Upload PDF / TXT', type=['pdf', 'txt'], accept_multiple_files=False)
-    text_paste = st.text_area('Or paste text (e.g., IFRC excerpts)')
-    src_id = st.text_input('Source ID (name)', value='source_' + str(np.random.randint(1000,9999)))
+if st.sidebar.button("Load Standard Medical Sources"):
+    sources = {
+        "IFRC_2020": "https://www.ifrc.org/sites/default/files/2022-02/EN_GFARC_GUIDELINES_2020.pdf",
+        "ICRC": "https://www.icrc.org/sites/default/files/external/doc/en/assets/files/publications/icrc-002-0526.pdf"
+    }
 
-    if st.button('Add source'):
-        if uploaded_file is None and text_paste.strip() == '':
-            st.warning('Provide a PDF / TXT file or paste text to add a source.')
-        else:
-            if 'rag_engine' not in st.session_state:
-                st.session_state.rag_engine = RAGEngine()
-            rag: RAGEngine = st.session_state.rag_engine
-            try:
-                if uploaded_file is not None:
-                    if uploaded_file.type == 'application/pdf':
-                        data = uploaded_file.read()
-                        txt = extract_text_from_pdf(data)
-                    else:
-                        data = uploaded_file.read().decode('utf-8')
-                        txt = data
-                    rag.add_source(txt, source_id=src_id)
-                    st.success(f'Added source {src_id} with chunks: {len(chunk_text(txt))}')
-                else:
-                    rag.add_source(text_paste, source_id=src_id)
-                    st.success(f'Added pasted text as {src_id} with chunks: {len(chunk_text(text_paste))}')
-            except Exception as e:
-                st.error(f'Failed to add source: {e}')
+    for name, url in sources.items():
+        try:
+            pdf = requests.get(url).content
+            text = extract_pdf(pdf)
+            rag.add_source(text, name)
+        except:
+            st.sidebar.warning(f"Failed to load {name}")
 
-    if 'rag_engine' in st.session_state:
-        rag: RAGEngine = st.session_state.rag_engine
-        st.write(f"Sources: {len(rag.metadata)} chunks indexed")
-        if st.button('Clear KB'):
-            del st.session_state.rag_engine
-            st.experimental_rerun()
+    st.sidebar.success("Medical sources loaded")
 
-st.markdown('---')
 
-# Main area: query and results
-col1, col2 = st.columns([2,3])
+uploaded = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
 
-with col1:
-    st.subheader('Ask a first-aid question')
-    user_query = st.text_area('Describe the situation or ask a question', height=150)
-    top_k = st.slider('Number of retrieved chunks (k)', min_value=1, max_value=10, value=5)
-    if st.button('Get guidance'):
-        if 'rag_engine' not in st.session_state:
-            st.warning('Knowledge base is empty. Upload at least one authoritative source in the sidebar.')
-        elif user_query.strip() == '':
-            st.warning('Please enter a question or description of the situation.')
-        else:
-            rag: RAGEngine = st.session_state.rag_engine
-            with st.spinner('Retrieving and assembling answer...'):
-                ans = rag.assemble_answer(user_query, top_k=top_k)
-            # Emergency banner
-            if ans['is_emergency']:
-                st.error('POTENTIAL EMERGENCY DETECTED — CALL EMERGENCY SERVICES IMMEDIATELY. Keywords: ' + ', '.join(ans['emergency_keys']))
+if uploaded:
+    text = extract_pdf(uploaded.read())
+    rag.add_source(text, uploaded.name)
+    st.sidebar.success("File added to KB")
 
-            st.markdown('**Summary**')
-            st.write(ans['summary'])
-            st.markdown('**Step-by-step guidance (assembled from retrieved sources)**')
-            if len(ans['steps']) == 0:
-                st.info('No clear procedural steps found in retrieved excerpts. Below are the retrieved excerpts to consult.')
-            else:
-                for i, s in enumerate(ans['steps'], start=1):
-                    st.markdown(f"**{i}.** {s}")
 
-            st.markdown('**Sources & excerpts**')
-            for s in ans['sources']:
-                st.write('Source:', s['source_id'])
-                st.caption(s['excerpt'][:1000])
+# ---------------- MAIN ----------------
+query = st.text_area("Describe the situation or ask a first-aid question")
 
-with col2:
-    st.subheader('KB Explorer')
-    if 'rag_engine' not in st.session_state:
-        st.info('No sources indexed yet.')
+top_k = st.slider("Retrieval depth (k)", 1, 10, 5)
+
+if st.button("Get Guidance"):
+    if not query.strip():
+        st.warning("Please enter a query.")
+    elif not rag.text_chunks:
+        st.warning("Knowledge base is empty.")
     else:
-        rag: RAGEngine = st.session_state.rag_engine
-        st.write(f'Indexed chunks: {len(rag.text_chunks)}')
-        q_explore = st.text_input('Search KB (semantic) — enter a phrase to find related chunks')
-        if st.button('Search KB'):
-            if q_explore.strip() == '':
-                st.warning('Enter a search phrase.')
-            else:
-                res = rag.retrieve(q_explore, top_k=10)
-                for dist, text, meta in res:
-                    st.write('Source:', meta.get('source_id', ''))
-                    st.caption(text[:800])
-                    st.write('Distance:', round(dist, 4))
+        with st.spinner("Analyzing..."):
+            ans = rag.assemble_answer(query, top_k)
 
-st.markdown('---')
-st.caption('This app assembles answers by selecting and presenting authoritative excerpts. It does not perform open-ended medical generation; for safety, steps are taken from the indexed sources. If you want an LLM-based final phrasing, integrate a local open-source model and replace assemble_answer with a model call.');
+        # 🚨 Emergency Banner
+        if ans["emergency"]["is_emergency"]:
+            st.error(
+                f"🚨 EMERGENCY DETECTED (Severity: {ans['emergency']['severity']})\n"
+                f"Triggers: {', '.join(ans['emergency']['triggers'])}\n"
+                f"👉 Call emergency services immediately."
+            )
+
+        tabs = st.tabs(["🩺 Guidance", "⚠️ Warnings", "🔍 Explainability", "📚 Sources"])
+
+        with tabs[0]:
+            st.subheader("Step-by-step Guidance")
+            for i, step in enumerate(ans["steps"], 1):
+                st.markdown(f"**{i}.** {step}")
+
+        with tabs[1]:
+            if ans["warnings"]:
+                st.subheader("What NOT to do")
+                for w in ans["warnings"]:
+                    st.warning(w)
+
+        with tabs[2]:
+            st.subheader("Why these steps?")
+            for e in ans["explain"]:
+                st.write(f"• {e['step']}")
+                st.caption(f"Source: {e['source']} | Confidence: {e['confidence']}")
+
+        with tabs[3]:
+            for _, text, meta in ans["sources"]:
+                st.write("Source:", meta["source"])
+                st.caption(text[:400])
+
+
+st.markdown("---")
+st.caption("⚠️ This tool provides educational first-aid guidance from authoritative sources. Always seek professional medical help in emergencies.")
